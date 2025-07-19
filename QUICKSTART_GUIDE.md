@@ -15,13 +15,13 @@ gcloud config set project $PROJECT_ID
 gcloud config set run/region europe-west1
 
 # 3. Enable required APIs
-gcloud services enable run.googleapis.com cloudbuild.googleapis.com
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com aiplatform.googleapis.com
 ```
 
 ## 🤖 Deploy A Pre-Built Gemma LLM Container (10-15 minutes)
 
 ```bash
-# Deploy Gemma 3-1B directly to Cloud Run with one command (secure by default)
+# Deploy Gemma 3-4B directly to Cloud Run with one command (secure by default)
 gcloud run deploy SERVICE_NAME \
     --image us-docker.pkg.dev/cloudrun/container/gemma/GEMMA_PARAMETER \
     --concurrency 4 \
@@ -30,10 +30,11 @@ gcloud run deploy SERVICE_NAME \
     --gpu-type nvidia-l4 \
     --max-instances 1 \
     --memory 32Gi \
-    --no-allow-unauthenticated \
+    --allow-unauthenticated \
     --no-cpu-throttling \
     --timeout=600 \
     --region REGION \
+    --no-gpu-zonal-redundancy \
     --labels dev-tutorial=hackathon-nyc-cloud-run-gpu-25
 
 # SERVICE_NAME = anything-you-want
@@ -75,7 +76,7 @@ Before deploying the hackathon agent, let's test the Gemma service to make sure 
 
 ```bash
 # Start the proxy (choose Y when prompted to install cloud-run-proxy component)
-gcloud run services proxy gemma-service --port=9090
+gcloud run services proxy SERVICE_NAME --port=9090
 ```
 
 In a separate terminal tab, test the service:
@@ -102,7 +103,7 @@ cat > .env << EOF
 GEMMA_URL=$GEMMA_URL
 GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_CLOUD_LOCATION=us-central1
-GOOGLE_GENAI_USE_VERTEXAI=FALSE
+GOOGLE_GENAI_USE_VERTEXAI=TRUE
 EOF
 
 echo "⚠️  Please edit .env file and update the following values:"
@@ -110,7 +111,7 @@ echo "   - GOOGLE_CLOUD_PROJECT: Set to your actual project ID"
 echo "   - GEMMA_URL: Already set to $GEMMA_URL"
 
 # 3. Export environment variables from .env file
-cd hackathon_agent
+cd hackathon-agent
 export $(cat .env | xargs)
 
 # 4. Deploy to Cloud Run (secure by default)
@@ -125,7 +126,7 @@ gcloud run deploy hackathon-agent \
     --set-env-vars GOOGLE_GENAI_USE_VERTEXAI=$GOOGLE_GENAI_USE_VERTEXAI
 
 # 5. Get your agent URL
-export AGENT_URL=$(gcloud run services describe hackathon-agent --region=us-central1 --format='value(status.url)')
+export AGENT_URL=$(gcloud run services describe hackathon-agent --region=REGION --format='value(status.url)')
 echo "🎉 Agent deployed at: $AGENT_URL"
 ```
 

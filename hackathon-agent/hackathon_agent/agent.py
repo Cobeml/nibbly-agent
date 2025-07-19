@@ -13,11 +13,11 @@
 # limitations under the License.
 
 import os
+import json
 from pathlib import Path
 from typing import Dict, Any
 
-from google import genai
-from google.genai.types import HttpOptions
+import requests
 from dotenv import load_dotenv
 from google.adk.agents import Agent
 import google.auth.transport.requests
@@ -30,26 +30,16 @@ load_dotenv(dotenv_path=dotenv_path)
 
 
 class GemmaClient:
-    """Client for interacting with the deployed Gemma model using GenAI SDK."""
+    """Client for interacting with the deployed Gemma model using direct HTTP requests."""
 
-    def __init__(self, gemma_url: str, api_key: str):
+    def __init__(self, gemma_url: str):
         self.gemma_url = gemma_url.rstrip('/')
-        self.api_key = api_key
-        self.model_name = "gemma-3n-e4b-it"
+        self.model_name = "gemma3:4b"
         
         # Get authentication headers for Cloud Run service-to-service calls
-        auth_headers = self._get_auth_headers()
+        self.auth_headers = self._get_auth_headers()
 
-        print("auth headers", auth_headers)
-        
-        # Configure the client to use Cloud Run endpoint with authentication headers
-        self.client = genai.Client(
-            api_key=self.api_key,
-            http_options=HttpOptions(
-                base_url=self.gemma_url,
-                headers=auth_headers
-            )
-        )
+        print("auth headers", self.auth_headers)
 
     def _get_auth_headers(self) -> Dict[str, str]:
         """Get authentication headers for Cloud Run service-to-service calls."""
@@ -72,22 +62,56 @@ class GemmaClient:
         return headers
 
     def query_gemma(self, prompt: str, temperature: float = 0.7) -> str:
-        """Query the deployed Gemma model."""
+        """Query the deployed Gemma model using direct HTTP requests."""
         try:
             print("gemma url", self.gemma_url)
             print("using model", self.model_name)
             
-            # Generate content using the GenAI SDK
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=[prompt],
-                config=genai.types.GenerateContentConfig(
-                    temperature=temperature
-                )
+            # Prepare the request payload to match the working curl format
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {
+                                "text": prompt
+                            }
+                        ]
+                    }
+                ]
+            }
+            
+            # Make the HTTP request to the correct Gemma endpoint
+            endpoint_url = f"{self.gemma_url}/v1beta/models/{self.model_name}:generateContent"
+            response = requests.post(
+                endpoint_url,
+                headers=self.auth_headers,
+                json=payload,
+                timeout=30
             )
             
-            return response.text if response.text else "No response from model"
+            response.raise_for_status()  # Raise an exception for HTTP error status codes
             
+            # Parse the response
+            response_data = response.json()
+            
+            # Extract text from response (adjust based on actual Gemma API response format)
+            if 'candidates' in response_data and response_data['candidates']:
+                candidate = response_data['candidates'][0]
+                if 'content' in candidate and 'parts' in candidate['content']:
+                    parts = candidate['content']['parts']
+                    if parts and 'text' in parts[0]:
+                        return parts[0]['text']
+            elif 'text' in response_data:
+                return response_data['text']
+            elif 'response' in response_data:
+                return response_data['response']
+            
+            return "No response from model"
+            
+        except requests.exceptions.RequestException as e:
+            return f"HTTP request error: {str(e)}"
+        except json.JSONDecodeError as e:
+            return f"JSON decode error: {str(e)}"
         except Exception as e:
             return f"Error querying Gemma: {str(e)}"
 
@@ -101,14 +125,11 @@ def get_gemma_client() -> GemmaClient:
     global gemma_client
     if gemma_client is None:
         gemma_url = os.getenv("GEMMA_URL")
-        api_key = os.getenv("GOOGLE_API_KEY")
         
         if not gemma_url:
             raise ValueError("GEMMA_URL environment variable is required")
-        if not api_key:
-            raise ValueError("GOOGLE_API_KEY environment variable is required")
             
-        gemma_client = GemmaClient(gemma_url, api_key)
+        gemma_client = GemmaClient(gemma_url)
     return gemma_client
 
 
@@ -292,4 +313,4 @@ root_agent = Agent(
 
         Your tools connect to a deployed Gemma model, so you can provide rich, detailed responses powered by that model while maintaining the conversational interface through your own capabilities.""",
     tools=[ask_gemma, generate_code, brainstorm_ideas, explain_concept],
-) 
+)
