@@ -15,19 +15,28 @@
 import os
 import json
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
 import requests
 from dotenv import load_dotenv
 from google.adk.agents import Agent
 import google.auth.transport.requests
 import google.oauth2.id_token
+from opik.integrations.adk import OpikTracer  # For Opik integration
+import websocket  # For WebSocket communication with ROS2
+import time  # For timestamps and timeouts
 
 # Load environment variables from .env file in root directory
 root_dir = Path(__file__).parent.parent
 dotenv_path = root_dir / ".env"
 load_dotenv(dotenv_path=dotenv_path)
 
+# Environment variables
+GEMMA_URL = os.getenv("GEMMA_URL")
+if not GEMMA_URL:
+    raise ValueError("GEMMA_URL environment variable is required")
+
+ROS2_WS_URL = os.getenv("ROS2_WS_URL", "wss://a78a6101be74.ngrok-free.app")  # Configurable WebSocket URL for ROS2
 
 class GemmaClient:
     """Client for interacting with the deployed Gemma model using direct HTTP requests."""
@@ -124,12 +133,7 @@ def get_gemma_client() -> GemmaClient:
     """Get or create the Gemma client instance."""
     global gemma_client
     if gemma_client is None:
-        gemma_url = os.getenv("GEMMA_URL")
-        
-        if not gemma_url:
-            raise ValueError("GEMMA_URL environment variable is required")
-            
-        gemma_client = GemmaClient(gemma_url)
+        gemma_client = GemmaClient(GEMMA_URL)
     return gemma_client
 
 
@@ -296,21 +300,180 @@ def explain_concept(concept: str, level: str) -> Dict[str, Any]:
             "concept": concept
         }
 
+# Helper class for ROSBridge WebSocket communication
+class ROSBridge:
+    def __init__(self, url: str = ROS2_WS_URL):
+        try:
+            self.ws = websocket.create_connection(url, timeout=10)
+        except Exception as e:
+            raise ConnectionError(f"Failed to connect to ROS2 WebSocket: {str(e)}")
 
-# Create the ADK agent
+    def publish(self, topic: str, msg_type: str, msg: Dict[str, Any]):
+        data = {
+            "op": "publish",
+            "topic": topic,
+            "type": msg_type,
+            "msg": msg
+        }
+        self.ws.send(json.dumps(data))
+
+    def subscribe_and_receive(self, topic: str, timeout: int = 30) -> Dict[str, Any]:
+        subscribe_data = {
+            "op": "subscribe",
+            "topic": topic
+        }
+        self.ws.send(json.dumps(subscribe_data))
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                response_str = self.ws.recv()
+                if not response_str:
+                    continue
+                response = json.loads(response_str)
+                if response.get("op") == "publish" and response.get("topic") == topic:
+                    return response["msg"]
+            except websocket.WebSocketTimeoutException:
+                continue
+            except Exception as e:
+                raise ValueError(f"Error receiving from {topic}: {str(e)}")
+        
+        raise TimeoutError(f"Timeout waiting for response from {topic}")
+
+    def close(self):
+        self.ws.close()
+
+# New tools for drone delivery interactions via ROS2 WebSocket
+
+def get_restaurant_options() -> Dict[str, Any]:
+    """Get available restaurant and food options from the ROS2 backend."""
+    try:
+        bridge = ROSBridge()
+        bridge.publish('/delivery/restaurant_request', 'std_msgs/String', {'data': ''})
+        response = bridge.subscribe_and_receive('/delivery/restaurant_data')
+        bridge.close()
+        return {
+            "status": "success",
+            "restaurant_data": json.loads(response['data']) if 'data' in response else response
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_message": f"Failed to get restaurant options: {str(e)}"
+        }
+
+def create_delivery_order(restaurant_id: str, customer_name: str, delivery_location: Dict[str, float], items: List[str], priority: int = 3, special_instructions: str = "") -> Dict[str, Any]:
+    """Create a new delivery order via the ROS2 backend."""
+    try:
+        order_id = f"AI-{int(time.time())}"
+        order_data = {
+            "order_id": order_id,
+            "restaurant_id": restaurant_id,
+            "customer_name": customer_name,
+            "delivery_location": delivery_location,
+            "items": items,
+            "priority": priority,
+            "special_instructions": special_instructions
+        }
+        
+        bridge = ROSBridge()
+        bridge.publish('/delivery/order_request', 'std_msgs/String', {'data': json.dumps(order_data)})
+        bridge.close()
+        
+        return {
+            "status": "success",
+            "order_id": order_id,
+            "order_details": order_data
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_message": f"Failed to create delivery order: {str(e)}",
+            "order_details": {
+                "restaurant_id": restaurant_id,
+                "customer_name": customer_name,
+                "delivery_location": delivery_location,
+                "items": items,
+                "priority": priority,
+                "special_instructions": special_instructions
+            }
+        }
+
+def track_order_status(order_id: str, duration: int = 300) -> Dict[str, Any]:
+    """Track the status of a delivery order via the ROS2 backend."""
+    try:
+        bridge = ROSBridge()
+        start_time = time.time()
+        while time.time() - start_time < duration:
+            response = bridge.subscribe_and_receive('/delivery/status', timeout=5)  # Short timeout per check
+            status_data = json.loads(response['data']) if 'data' in response else response
+            
+            if status_data.get('current_order_id') == order_id:
+                bridge.close()
+                return {
+                    "status": "success",
+                    "order_id": order_id,
+                    "order_status": status_data
+                }
+            
+            time.sleep(1)
+        
+        bridge.close()
+        return {
+            "status": "error",
+            "error_message": "Order tracking timeout",
+            "order_id": order_id
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_message": f"Failed to track order status: {str(e)}",
+            "order_id": order_id
+        }
+
+def get_delivery_locations() -> Dict[str, Any]:
+    """Get available delivery locations from the ROS2 backend."""
+    try:
+        bridge = ROSBridge()
+        response = bridge.subscribe_and_receive('/delivery/delivery_locations', timeout=10)  # Since publishes every 5s, 10s should suffice
+        bridge.close()
+        return {
+            "status": "success",
+            "delivery_locations": json.loads(response['data']) if 'data' in response else response
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_message": f"Failed to get delivery locations: {str(e)}"
+        }
+
+# Initialize Opik tracer for visibility and tracing
+opik_tracer = OpikTracer()
+
+# Create the ADK agent with Opik tracing callbacks and updated tools
 root_agent = Agent(
-    name="hackathon_agent",
+    name="snack_bot",
     model="gemini-2.5-flash",
-    instruction="""You are a helpful AI assistant designed for the Cloud Run Hackathon. 
+    instruction="""You are the Snack Bot, a helpful AI assistant for Nibbly, the drone delivery service for snacks and food. 
 
-        You can help participants by:
+        You can help users by:
         1. Answering questions and providing information on various topics
         2. Generating code in different programming languages
         3. Brainstorming creative ideas for projects
         4. Explaining complex concepts at different levels of detail
+        5. Getting restaurant and menu options using get_restaurant_options
+        6. Creating drone delivery orders using create_delivery_order
+        7. Tracking order status using track_order_status
+        8. Getting available delivery locations using get_delivery_locations, especially to figure out coordinates for locations like the user's office when they request an order to such places
 
-        You have access to a deployed Gemma model that you can query for additional insights and information. Always try to be helpful, creative, and supportive of hackathon participants' goals.
+        You have access to a deployed Gemma model that you can query for additional insights and information. Always try to be helpful, creative, and supportive. Use the delivery tools when handling restaurant browsing, order creation, or tracking requests. When a user requests an order to their office or similar named locations, use get_delivery_locations to retrieve available locations and select the appropriate coordinates. Always make the call to create_delivery_order with the delivery_location set to {'x': 3720, 'y': 3920, 'z': 5.0}, as this is the fixed user's office location.
 
-        Your tools connect to a deployed Gemma model, so you can provide rich, detailed responses powered by that model while maintaining the conversational interface through your own capabilities.""",
-    tools=[ask_gemma, generate_code, brainstorm_ideas, explain_concept],
+        Your tools connect to a deployed Gemma model and a ROS2 backend via WebSocket for drone operations, so you can provide rich, detailed responses while maintaining the conversational interface.""",
+    tools=[ask_gemma, generate_code, brainstorm_ideas, explain_concept, get_restaurant_options, create_delivery_order, track_order_status, get_delivery_locations],
+    before_agent_callback=opik_tracer.before_agent_callback,
+    after_agent_callback=opik_tracer.after_agent_callback,
+    before_model_callback=opik_tracer.before_model_callback,
+    after_model_callback=opik_tracer.after_model_callback,
+    before_tool_callback=opik_tracer.before_tool_callback,
+    after_tool_callback=opik_tracer.after_tool_callback,
 )
